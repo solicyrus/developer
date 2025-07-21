@@ -1,0 +1,30 @@
+body{
+    background-color: lemonchiffon;
+    font-family: "Hlvetica Neue", Helvetica,Arial, sans-serif;
+    font-size: 1.5em;
+    color: darkslategray;
+}
+h1 {
+    color: mediumturquoise;
+    font-family: Georgia, serif;
+}
+form input [type="text"] {
+    width: 20%;
+    margin: 5px;
+    border: 2px solid peachpuff;
+    border-radius: 7px;
+}
+#images {
+    text-align: center;
+}
+#images img {
+    display: inline-block;
+    margin: 110px;
+}
+#videos {
+    text-align: center;
+}
+#videos iframe {
+    margin: 20px auto;
+    display: block;
+}
