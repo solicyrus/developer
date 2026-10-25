@@ -50,6 +50,13 @@ BUILTIN_PATTERNS = [
         "fix_hint": "Raise maxOutputTokens in generationConfig",
         "status": "fixed-2026-10-23",
     },
+    {
+        "id": "plan-format-table",
+        "symptom": "Plan not in the permanent table format (short, ~30-word explanations, clickable Maps links, no hour-by-hour)",
+        "check": "POST a 2-day Victoria plan request; answer must have Day headers, >=3 Google Maps place links each followed by an explanation, and no clock times",
+        "fix_hint": "Re-check assistant.php prompt ORGANIZED PLAN RULE + PLACE NAMES RULE",
+        "status": "active-2026-10-24",
+    },
 ]
 
 def load_patterns():
@@ -193,6 +200,42 @@ def check_plan_intake():
     except Exception as e:
         return {"ok": False, "detail": str(e)[:150]}
 
+def check_plan_format():
+    """Permanent plan format (Cyrus's order 2026-10-24): Day headers, one place
+    per line, place name as a clickable Google Maps link, ~30-word easy
+    explanation after it, NO hour-by-hour times, not an essay."""
+    try:
+        s, data = http_post_json("/api/assistant.php", {
+            "question": "Plan a 2-day trip to Victoria for 2 people",
+            "lang": "en", "history": []}, timeout=90)
+        ans = data.get("answer", "")
+        if not ans:
+            return {"ok": False, "detail": "empty answer"}
+        problems = []
+        if not re.search(r"day\s*1", ans, re.I):
+            problems.append("no Day 1 header")
+        links = re.findall(r"\[([^\]]+)\]\(https://www\.google\.com/maps[^)]*\)", ans)
+        if len(links) < 3:
+            problems.append(f"only {len(links)} Maps place links (need >=3)")
+        # each of the first 3 place lines must carry an explanation after the link
+        place_lines = [ln for ln in ans.split("\n") if "google.com/maps" in ln]
+        explained = 0
+        for ln in place_lines[:3]:
+            m = re.search(r"\)\s*[—\-:]\s*(.+)$", ln)
+            if m and len(m.group(1).split()) >= 5:
+                explained += 1
+        if place_lines and explained < min(3, len(place_lines)):
+            problems.append("place lines missing explanations")
+        if re.search(r"\b\d{1,2}:\d{2}\s*(am|pm)?\b|\b\d{1,2}\s*(am|pm)\b", ans, re.I):
+            problems.append("hour-by-hour times found")
+        if len(ans) > 5000:
+            problems.append(f"essay-length answer ({len(ans)} chars)")
+        if problems:
+            return {"ok": False, "detail": "; ".join(problems)}
+        return {"ok": True, "detail": f"table format OK ({len(links)} places, {len(ans)} chars)"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
 def check_homepage():
     try:
         s, html = http_get("/")
@@ -210,6 +253,7 @@ CHECKS = [
     ("no-raw-markdown", check_no_raw_markdown),
     ("paywall-text", check_paywall_text),
     ("plan-intake", check_plan_intake),
+    ("plan-format", check_plan_format),
 ]
 
 def run_all():
