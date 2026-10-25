@@ -14,7 +14,7 @@ Usage:
   python3 tour_super_robot.py --check     # run all checks, report
   python3 tour_super_robot.py --learn     # show learned patterns
 """
-import json, os, re, sys, time, urllib.request, urllib.parse
+import json, os, re, sys, time, urllib.request, urllib.parse, urllib.error
 
 BASE = "https://app.victoriatourandadventure.com"
 API = "https://cyrus-tour-guide-api.vercel.app"
@@ -159,7 +159,24 @@ def api_post(payload, timeout=30):
             time.sleep(2)
     raise last_err
 
-GREETING_RE = re.compile(r"سلام!\s*من\s+(سایرس|Cyrus)", re.IGNORECASE)
+def api_post_raw(path, payload, extra_headers=None, timeout=30):
+    """POST to the Python backend and return (status, body-text) WITHOUT
+    raising on HTTP errors — for guard checks that EXPECT a 401/400."""
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "TourSuperRobot/1.0"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(API + path, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", errors="replace")
+        except Exception:
+            return e.code, ""
+
+GREETING_RE = re.compile(r"سلام!\s*من\s+(سایرس|Cyrus)|hello!?\s+i'?m cyrus|hi there!?\s+i'?m cyrus", re.IGNORECASE)
 
 # ---------------------------------------------------------------- checks
 def check_api_health():
@@ -203,7 +220,7 @@ def check_no_raw_markdown():
 
 def check_paywall_text():
     try:
-        s, js = http_get("/js/i18n.js?v=9")
+        s, js = http_get("/js/i18n.js?v=11")
         m = re.search(r'buyAll:\s*"([^"]+)"', js)
         if not m:
             return {"ok": False, "detail": "buyAll string not found"}
@@ -325,16 +342,104 @@ def check_live_page_features():
     except Exception as e:
         return {"ok": False, "detail": str(e)[:150]}
 
+def check_api_key_guard():
+    """The Python backend must refuse requests without the app key (401) —
+    an open backend would burn the Gemini quota and invite abuse."""
+    try:
+        s, body = api_post_raw("/api/chat",
+            {"question": "ping", "lang": "en", "history": []})
+        if s == 401:
+            return {"ok": True, "detail": "no-key request refused (401)"}
+        return {"ok": False, "detail": f"no-key request got HTTP {s} (expected 401)"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
+def check_price_truth():
+    """The APP costs CA$5 ONE-TIME. During the 2026-10-24 migration the app
+    bot wrongly quoted the website's CA$10/14-day price — that mixup must
+    never come back."""
+    try:
+        s, data = api_post({
+            "question": "How much does the app cost?", "lang": "en", "history": []})
+        ans = data.get("answer", "")
+        if not ans:
+            return {"ok": False, "detail": "empty answer"}
+        problems = []
+        if "$10" in ans or "14 days" in ans.lower():
+            problems.append("quotes the WEBSITE price ($10/14 days) for the APP")
+        if "5" not in ans:
+            problems.append("does not mention the $5 app price")
+        if "one-time" not in ans.lower() and "one time" not in ans.lower():
+            problems.append("does not say one-time")
+        if problems:
+            return {"ok": False, "detail": "; ".join(problems)}
+        return {"ok": True, "detail": "app price truthful: $5 one-time"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
+def check_persian_lang():
+    """A Persian request must be answered in Persian (6-language promise)."""
+    try:
+        s, data = api_post({
+            "question": "ویکتوریا کجاست؟", "lang": "fa", "history": []})
+        ans = data.get("answer", "")
+        if not ans:
+            return {"ok": False, "detail": "empty answer"}
+        if not re.search(r"[؀-ۿ]", ans):
+            return {"ok": False, "detail": "Persian question got a non-Persian answer"}
+        return {"ok": True, "detail": f"Persian answered in Persian ({len(ans)} chars)"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
+def check_stream_works():
+    """Customers chat over the STREAMING path — it must emit chunk events
+    and a final done event. Non-stream checks passing is not enough."""
+    try:
+        key = _app_key()
+        s, body = api_post_raw("/api/chat",
+            {"question": "Say hello in one short sentence", "lang": "en",
+             "history": [], "stream": True},
+            extra_headers={"X-App-Key": key} if key else None, timeout=90)
+        if s != 200:
+            return {"ok": False, "detail": f"stream HTTP {s}"}
+        if '"chunk"' not in body:
+            return {"ok": False, "detail": "no chunk events in stream"}
+        if '"done"' not in body:
+            return {"ok": False, "detail": "no done event in stream"}
+        return {"ok": True, "detail": "stream emits chunks + done"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
+def check_email_endpoint():
+    """The email-this-plan endpoint must be alive and validating: an
+    invalid email is refused (400 from the handler, or 422 from FastAPI's
+    request validation) and NOTHING is sent (no daily spam)."""
+    try:
+        key = _app_key()
+        s, body = api_post_raw("/api/email-itinerary",
+            {"email": "not-an-email", "itinerary": "x"},
+            extra_headers={"X-App-Key": key} if key else None)
+        if s in (400, 422):
+            return {"ok": True, "detail": f"endpoint alive, invalid email refused ({s})"}
+        return {"ok": False, "detail": f"invalid email got HTTP {s} (expected 400/422)"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
 CHECKS = [
     ("api-health", check_api_health),
+    ("api-key-guard", check_api_key_guard),
     ("homepage", check_homepage),
     ("service-worker", check_service_worker),
     ("live-page-features", check_live_page_features),
     ("chat-memory", check_chat_memory),
     ("no-raw-markdown", check_no_raw_markdown),
+    ("persian-lang", check_persian_lang),
     ("paywall-text", check_paywall_text),
+    ("price-truth", check_price_truth),
     ("plan-intake", check_plan_intake),
     ("plan-format", check_plan_format),
+    ("stream-works", check_stream_works),
+    ("email-endpoint", check_email_endpoint),
 ]
 
 def run_all():
