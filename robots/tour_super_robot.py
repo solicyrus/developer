@@ -17,8 +17,21 @@ Usage:
 import json, os, re, sys, time, urllib.request, urllib.parse
 
 BASE = "https://app.victoriatourandadventure.com"
+API = "https://cyrus-tour-guide-api.vercel.app"
 HIDDEN = os.path.join(os.path.dirname(__file__), "..", "hidden_files")
 PATTERNS_FILE = os.path.join(HIDDEN, "tour-bug-patterns.jsonl")
+
+def _app_key():
+    """App key for the Python backend — from env or a LOCAL hidden file.
+    Never hardcode it here: this file is mirrored to a public repo."""
+    k = os.environ.get("CYRUS_TOUR_APP_KEY", "")
+    if not k:
+        try:
+            with open(os.path.join(HIDDEN, ".app-key"), encoding="utf-8") as f:
+                k = f.read().strip()
+        except Exception:
+            k = ""
+    return k
 
 # ---------------------------------------------------------------- patterns
 BUILTIN_PATTERNS = [
@@ -125,13 +138,34 @@ def http_post_json(path, payload, timeout=30):
             time.sleep(2)
     raise last_err
 
+def api_post(payload, timeout=30):
+    """POST to the Python chat backend (Vercel) with the app key.
+    The app chat moved from PHP assistant.php to this backend on
+    2026-10-25; assistant.php stays on the server as fallback only.
+    All chat checks MUST target this backend, never the PHP file."""
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "TourSuperRobot/1.0"}
+    key = _app_key()
+    if key:
+        headers["X-App-Key"] = key
+    req = urllib.request.Request(API + "/api/chat", data=data, headers=headers)
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    raise last_err
+
 GREETING_RE = re.compile(r"سلام!\s*من\s+(سایرس|Cyrus)", re.IGNORECASE)
 
 # ---------------------------------------------------------------- checks
 def check_api_health():
     # POST-only endpoint: GET returns 400, so test with a real POST instead
     try:
-        s, data = http_post_json("/api/assistant.php",
+        s, data = api_post(
             {"question": "ping", "lang": "en", "history": []})
         ok = bool(data.get("answer"))
         return {"ok": ok, "detail": f"POST answer: {ok}"}
@@ -145,7 +179,7 @@ def check_chat_memory():
             {"role": "user", "text": "Hello"},
             {"role": "bot", "text": "سلام! من سایرس، راهنمای هوشمند سفر شما هستم. چطور کمکتون کنم؟"},
         ]
-        s, data = http_post_json("/api/assistant.php", {
+        s, data = api_post( {
             "question": "What about Niagara Falls?", "lang": "en", "history": history})
         ans = data.get("answer", "")
         if not ans:
@@ -158,7 +192,7 @@ def check_chat_memory():
 
 def check_no_raw_markdown():
     try:
-        s, data = http_post_json("/api/assistant.php", {
+        s, data = api_post( {
             "question": "Tell me about Victoria", "lang": "en", "history": []})
         ans = data.get("answer", "")
         if "**" in ans:
@@ -182,7 +216,7 @@ def check_paywall_text():
 def check_plan_intake():
     """Bot must ASK for days/people/destination before planning (standing order)."""
     try:
-        s, data = http_post_json("/api/assistant.php", {
+        s, data = api_post( {
             "question": "Plan a trip for me", "lang": "en", "history": []})
         ans = data.get("answer", "")
         if not ans:
@@ -205,7 +239,7 @@ def check_plan_format():
     per line, place name as a clickable Google Maps link, ~30-word easy
     explanation after it, NO hour-by-hour times, not an essay."""
     try:
-        s, data = http_post_json("/api/assistant.php", {
+        s, data = api_post( {
             "question": "Plan a 2-day trip to Victoria for 2 people",
             "lang": "en", "history": []}, timeout=90)
         ans = data.get("answer", "")
@@ -241,14 +275,61 @@ def check_homepage():
         s, html = http_get("/")
         ok = s == 200 and "Cyrus AI Tour Guide" in html
         has_history = "history: chatHistory" in html or "chatHistory" in html
-        return {"ok": ok and has_history,
-                "detail": f"HTTP {s}, history-js: {has_history}"}
+        on_python = "cyrus-tour-guide-api.vercel.app" in html
+        return {"ok": ok and has_history and on_python,
+                "detail": f"HTTP {s}, history-js: {has_history}, python-api: {on_python}"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
+def check_service_worker():
+    """THE 2026-10-25 LESSON: sw.js v23 was cache-first for pages, so every
+    returning visitor kept an OLD page forever and deploys were invisible
+    (Cyrus saw raw text while the server file was perfect). The live sw.js
+    must be network-first for pages and carry the current cache version."""
+    try:
+        s, js = http_get("/sw.js")
+        if s != 200:
+            return {"ok": False, "detail": f"sw.js HTTP {s}"}
+        problems = []
+        if "navigate" not in js:
+            problems.append("no network-first navigation handling (cache-first trap)")
+        m = re.search(r"vta-shell-v(\d+)", js)
+        if not m:
+            problems.append("no vta-shell cache version found")
+        elif int(m.group(1)) < 24:
+            problems.append(f"stale cache version v{m.group(1)} (need >= v24)")
+        if problems:
+            return {"ok": False, "detail": "; ".join(problems)}
+        return {"ok": True, "detail": f"sw network-first, cache v{m.group(1)}"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150]}
+
+def check_live_page_features():
+    """The customer-facing features must exist in the LIVE page: the
+    beautiful plan table (vta-stop cards), voice (mic + read-aloud) and the
+    email-this-plan button. Text/API checks alone are NOT verification —
+    2026-10-25 the API passed while customers saw raw markdown."""
+    try:
+        s, html = http_get("/")
+        need = {
+            "plan-table CSS (vta-stop)": "vta-stop" in html,
+            "mic button": "vta-chat-mic" in html,
+            "read-aloud toggle": "vta-voice-toggle" in html,
+            "email-plan button": "vtaEmailButton" in html,
+            "email endpoint": "/api/email-itinerary" in html,
+        }
+        missing = [k for k, v in need.items() if not v]
+        if missing:
+            return {"ok": False, "detail": "missing on live page: " + ", ".join(missing)}
+        return {"ok": True, "detail": "table + voice + email features all present"}
     except Exception as e:
         return {"ok": False, "detail": str(e)[:150]}
 
 CHECKS = [
     ("api-health", check_api_health),
     ("homepage", check_homepage),
+    ("service-worker", check_service_worker),
+    ("live-page-features", check_live_page_features),
     ("chat-memory", check_chat_memory),
     ("no-raw-markdown", check_no_raw_markdown),
     ("paywall-text", check_paywall_text),
